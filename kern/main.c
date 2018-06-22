@@ -16,6 +16,10 @@ static int __init rdx_init(void)
 	rdx_sign_test();
 	pr_warn("sign test finish.");
 
+	pr_warn("AES test start...");
+	rdx_aes_test();
+	pr_warn("AES test finish.");
+
 	return 0;
 }
 

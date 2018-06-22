@@ -7,6 +7,8 @@
 #include <linux/kernel.h>
 #include <linux/scatterlist.h>
 #include <crypto/akcipher.h>
+#include <crypto/skcipher.h>
+#include <linux/random.h>
 
 #include "rdx_crypto.h"
 
@@ -279,6 +281,129 @@ int rdx_akcrypto_sign_ver(void *input, int len, void *output, int phase)
      crypto_free_akcipher(tfm);
      return err;
 }
+
+#define AES_KEY_LEN 32
+#define IV_LEN 16
+unsigned char *aes_key =
+		"\xF0\xC9\x3C\xEE\x09\x9E\xDE\x2E\xF7\x48\xB7\x62\xE3\xC6\x60\x4B"
+		"\x24\x74\xAC\x0C\xEC\xF3\xAF\x95\x2E\x4D\x78\xDD\x45\xCC\x2D\xBF";
+unsigned char *iv_data =
+		"\x62\x06\xF3\x02\x20\xFE\x06\xED\xFD\x49\x08\x4D\x1C\x2C\x19\x38";
+
+static int __rdx_akcrypto_tfm_aes(struct crypto_skcipher *tfm,
+			void *input, int len, void *output, int phase)
+{
+	struct skcipher_request *req;
+	void *out_buf = NULL;
+//	struct tcrypt_result result;
+	unsigned int out_len_max = 0;
+	struct scatterlist src, dst;
+	void *xbuf = NULL;
+	int err = 0;
+	char *ivdata;
+
+	xbuf = kzalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!xbuf)
+		return err;
+
+	req = skcipher_request_alloc(tfm, GFP_KERNEL);
+	if (!req)
+		goto free_xbuf;
+
+//	init_completion(&result.completion);
+
+//	if (!phase) {
+//		pr_debug("set pub key \n");
+//		err = crypto_akcipher_set_pub_key(tfm, pub_key, pub_key_len);
+//	} else {
+//		pr_debug("set priv key\n");
+//		//err = crypto_akcipher_set_pub_key(tfm, pub_key, pub_key_len);
+//		err = crypto_akcipher_set_priv_key(tfm, priv_key, priv_key_len);
+//	}
+	err = crypto_skcipher_setkey(tfm, aes_key, AES_KEY_LEN);
+
+	if (err){
+		pr_err("set key error! err: %d phase: %d\n", err, phase);
+		goto free_req;
+	}
+
+	/* IV will be random */
+	ivdata = kzalloc(16, GFP_KERNEL);
+	if (!ivdata) {
+		pr_info("could not allocate ivdata\n");
+		goto free_req;
+	}
+	memcpy(ivdata, iv_data, 16);//get_random_bytes(ivdata, 16);
+
+
+	err = -ENOMEM;
+	pr_debug("out_len_max = %d, len = %d\n", out_len_max, len);
+	out_buf = kzalloc(PAGE_SIZE, GFP_KERNEL);
+
+	if (!out_buf)
+		goto free_req;
+
+	if (WARN_ON(len > PAGE_SIZE))
+		goto free_all;
+	memcpy(xbuf, input, len);
+	sg_init_one(&src, xbuf, 16);
+	sg_init_one(&dst, out_buf, 16);
+
+	skcipher_request_set_crypt(req, &src, &dst, 16, ivdata);
+
+//    akcipher_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+//                               tcrypt_complete, &result);
+
+	if (phase) { //sign phase
+		//err = wait_async_op(&result, crypto_akcipher_encrypt(req));
+		pr_warn ("start enc\n");
+		err =  crypto_skcipher_encrypt(req);
+		if (err) {
+			pr_err("skcipher: encrypt failed. err %d\n", err);
+			goto free_all;
+		}
+		pr_debug("after encrypt in out_buf:\n");
+		//hexdump(out_buf, out_len_max);
+		memcpy(output, out_buf, 16);
+	} else { //verification phase
+		pr_warn("dec start\n");
+		//err = wait_async_op(&result, crypto_akcipher_decrypt(req));
+		err =  crypto_skcipher_decrypt(req);
+		if (err) {
+			pr_err("skcipher: decrypt failed. err %d\n",
+					err);
+			goto free_all;
+		}
+		pr_debug("after decrypt in out_buf:\n");
+		//hexdump(out_buf, out_len_max);
+		memcpy(output, out_buf, 16);
+	}
+
+free_all:
+	kfree(out_buf);
+free_req:
+	skcipher_request_free(req);
+free_xbuf:
+	kfree(xbuf);
+	return err;
+}
+
+int rdx_akcrypto_aes(void *input, int len, void *output, int phase)
+{
+     struct crypto_skcipher *tfm;
+     int err = 0;
+
+     tfm = crypto_alloc_skcipher("cbc-aes-aesni", 0, 0);
+     if (IS_ERR(tfm)) {
+             pr_err("alg: skcipher: Failed to load tfm for aes: %ld\n", PTR_ERR(tfm));
+             return PTR_ERR(tfm);
+     }
+     err = __rdx_akcrypto_tfm_aes(tfm, input, len, output, phase);
+
+     crypto_free_skcipher(tfm);
+     return err;
+}
+
 char *msg = "\x54\x85\x9b\x34\x2c\x49\xea\x2a";
 int msg_len = 8;
 
@@ -343,3 +468,35 @@ err:
 	kfree(m);
 	return ret;
 }
+
+int rdx_aes_test(void)
+{
+	int ret = 0;
+	char *c, *m;
+	c = kzalloc(IV_LEN, GFP_KERNEL);
+	m = kzalloc(IV_LEN, GFP_KERNEL);
+
+	pr_warn("initial msg :\n");
+	hexdump(msg, msg_len);
+
+	ret = rdx_akcrypto_aes(msg, msg_len, c, RDX_ENCRYPT);
+	if (ret) {
+		pr_err ("AES encrypt error\n");
+		goto err;
+	}
+	pr_warn("encrypted msg :\n");
+	hexdump(c, KEY_LEN);
+
+	ret = rdx_akcrypto_aes(c, 16, m, RDX_DECRYPT);
+	if (ret) {
+		pr_err ("Decryption error \n");
+		goto err;
+	}
+	pr_warn("decrypted msg :\n");
+	hexdump(m, 16);
+err:
+	kfree(c);
+	kfree(m);
+	return ret;
+}
+
